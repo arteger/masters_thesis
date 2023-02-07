@@ -1,0 +1,528 @@
+\renewcommand\chaptername{Appendix}
+\chapter{Dataless network implementation}
+\begin{lstlisting}
+import gc
+import logging
+import os
+import matplotlib.pyplot as plt
+import networkx as nx
+import networkx.algorithms.community as nx_comm
+import numpy as np
+import random
+import scipy
+from scipy.optimize import differential_evolution, linprog
+import tensorflow as tf
+import time
+import warnings
+
+class DnnResult():
+    def __init__(self, theta, stuck):
+        self.theta = theta
+        self.stuck = stuck
+
+class ValidationResult():
+    def __init__(self, valid, can_add_nodes, contains_extra_nodes):
+        self.valid = valid
+        self.can_add_nodes = can_add_nodes
+        self.contains_extra_nodes = contains_extra_nodes 
+
+def clip(l,r,x):
+    return max(l,min(r,x))
+
+def calc_W(G, C):
+    n = len(G.nodes())
+    m = len(G.edges())
+    m_c = len(C.edges())
+    W = np.zeros((n,n+m+m_c),dtype= 'float32')
+    for i in range(n):
+        W[i][i] = 1
+    j = n
+    for edge in G.edges():
+        x = int(edge[0])
+        y = int(edge[1])
+        W[x][j] = 1
+        W[y][j] = 1
+        j+=1
+    for edge in C.edges():
+        x = int(edge[0])
+        y = int(edge[1])
+        W[x][j] = 1
+        W[y][j] = 1
+        j+=1
+    return W
+
+def calc_b(G, C):
+    n = len(G.nodes())
+    m = len(G.edges())
+    m_c = len(C.edges())
+    b = np.array([-1/2 for i in range(n)])
+    b_m = np.array([-1 for i in range(m+m_c)])
+    return np.concatenate((b,b_m))
+
+def calc_w(G, C):
+    n = len(G.nodes())
+    m = len(G.edges())
+    m_c = len(C.edges())
+    w = np.array([-1 for i in range(n)])
+    w_n = np.array([n for i in range(m)])
+    w_c = np.array([-1 for i in range(m_c)])
+    return np.concatenate((w,w_n,w_c))
+
+def build_theta(G):
+    n = len(G.nodes())
+    max_degree = max([G.degree(i) for i in range(n)])
+    if max_degree == 0:
+        return np.array([1 for i in range(n)])
+    return np.array([clip(0,1,1 - G.degree(i)/max_degree + random.random()/10000) for i in range(n)])
+
+def build_network(G):
+    logging.debug("Build network on graph G:{}.".format(str(G)))
+    C = nx.complement(G)
+    W = calc_W(G, C)
+    b = calc_b(G, C)
+    w = calc_w(G, C)
+    theta = build_theta(G)
+    return (W,b,w, theta, C)
+
+def get_result_nodes(theta, alpha = 0.5):
+    return set(np.argwhere(theta > alpha).reshape(-1))
+
+def not_connected_nodes_exist_in_G(G, result_nodes):
+    for v in G.nodes():
+        if v not in result_nodes:
+            node_not_connected_to_G = True
+            for edge in G.neighbors(v):
+                if edge in result_nodes:
+                    node_not_connected_to_G = False
+                    break
+            if node_not_connected_to_G:
+                return True
+    return False
+            
+def graph_has_no_edges(G, result_nodes):
+    for v in result_nodes:
+        for edge in G.neighbors(v):
+            if edge in result_nodes:
+                return False
+    return True
+
+def mis_is_valid(G, mis):
+    has_extra_nodes = not graph_has_no_edges(G, mis)
+    not_connected_nodes_exist = not_connected_nodes_exist_in_G(G, mis)
+    return ValidationResult(not has_extra_nodes and not not_connected_nodes_exist,
+                            not_connected_nodes_exist, has_extra_nodes)
+               
+def result_is_valid(G, theta):
+    result_nodes = get_result_nodes(theta)
+    return mis_is_valid(G, result_nodes).valid
+
+def network(theta,e_n,W_t,b,w_t):
+    h = tf.math.multiply(e_n,theta)
+    h = tf.linalg.matvec(W_t,h)
+    h = tf.add(h,b)
+    h = tf.nn.relu(h)
+    h = tf.tensordot(w_t,h, 1)
+    return h
+    
+def network_evol(theta,e_n,W_t,b,w_t):
+    return network(theta,e_n,W_t,b,w_t).numpy()
+
+def loss(theta,e_n,W_t,b,w_t,h_d):
+    h = network(theta,e_n,W_t,b,w_t)
+    diff = (h-h_d)**2   
+    return diff
+
+def loss_evol(theta,e_n,W_t,b,w_t,h_d):
+    h = network_evol(theta,e_n,W_t,b,w_t)
+    return (h-h_d)**2  
+
+def evolutionary_train(n,theta,e_n,W_t,b,w_t,h_d):
+    bounds = [(0,1) for i in range(n)]
+    theta = differential_evolution(loss_evol, bounds, x0 = theta, args = (e_n,W_t,b,w_t,h_d))
+    theta = theta.x
+    return DnnResult(theta, False)
+
+def vectors_are_close(a,b):
+    norm_diff = np.linalg.norm(a-b)
+    return norm_diff < 1e-6 
+
+def gradient_train(G, max_epochs, theta,e_n,W_t,b,w_t,h_d):
+    epoch = 0
+    def local_loss():
+        return loss(theta,e_n,W_t,b,w_t,h_d)
+    optimizer=tf.optimizers.Adam(learning_rate=0.1,)
+    var_list = theta
+    solver_stuck = False
+    previous_theta = np.copy(theta.numpy())
+    while not result_is_valid(G, theta) and epoch < max_epochs and not solver_stuck:
+        optimizer.minimize(local_loss, var_list=var_list)
+        epoch+=1
+        if np.allclose(previous_theta, theta.numpy()):
+            solver_stuck = True
+        previous_theta = np.copy(theta.numpy())
+    return DnnResult(theta.numpy(),solver_stuck or epoch == max_epochs)
+
+def train_network(G, max_epochs, method="gradient"):
+    (W,b,w, theta, C) = build_network(G)
+    n = len(G.nodes())
+    W_t = tf.constant(W.T, dtype = 'float32')
+    b = tf.constant(b, dtype = 'float32')
+    w_t = tf.constant(w.T, dtype = 'float32')
+    theta = tf.Variable(theta,
+                        trainable=True,
+                        constraint = lambda x: tf.clip_by_value(theta,0,1),
+                        dtype = 'float32')
+    e_n = tf.constant(np.ones((n)),dtype = 'float32')
+    h_d = tf.constant(-n*n/2,dtype = 'float32') 
+
+    if method == "evolutionary":
+        result = evolutionary_train(n,theta, e_n,W_t,b,w_t,h_d)
+    elif method == "gradient":
+        result = gradient_train(G, max_epochs,theta, e_n,W_t,b,w_t,h_d)
+    return result
+
+def find_inter_cluster_edges(G, communities):
+    edges = dict()
+    for com in communities:
+        for node_i in communities[com]:
+            for neighbour_i in G.neighbors(node_i):
+                if neighbour_i not in communities[com]:
+                    if edges.get(node_i) is not None:
+                        edges[node_i].add(neighbour_i)
+                    else:
+                        edges[node_i] = {neighbour_i}
+                    if edges.get(neighbour_i) is not None:
+                        edges[neighbour_i].add(node_i)
+                    else:
+                        edges[neighbour_i] = {node_i}
+    return edges
+
+def find_forbidden_edges(G, R, independent_sets):
+    forbidden = []
+    for u, edges in R.items():
+        if u in independent_sets:
+            for v in edges:
+                if v in independent_sets:
+                    forbidden.append((u, v))
+    return forbidden
+    
+def collect_list_by_dicts_key(partitions):
+    communities = {}
+    for key, val in partitions.items():
+        if communities.get(val) == None:
+            communities[val] = [key]
+        else:
+            communities[val].append(key)
+    return communities
+
+def collect_communities_to_map(communities):
+    new_com = {}
+    index = 0
+    for com in communities:
+        new_com[index] = com
+        index+=1
+    return new_com
+
+def build_G_from_nodes(G, nodes):
+    communities = {}
+    N = len(nodes)
+    new_G = nx.Graph()
+    index_map = dict()
+    node_map = dict()
+    index = 0
+    for node in nodes:
+        index_map[index] = node
+        node_map[node] = index
+        new_G.add_node(index)
+        index+=1
+    for i in nodes:
+        for j in nodes:
+            if G.has_edge(i,j):
+                new_G.add_edge(node_map[i], node_map[j])
+                new_G.add_edge(node_map[j], node_map[i])
+    return (new_G, index_map, node_map)
+
+def node_is_new_candidate(G, node, mis):
+    for w in G.neighbors(node):
+        neighbors_in_mis_count = 0
+        if w not in mis:
+            for n_w in G.neighbors(w):
+                if n_w in mis:
+                    neighbors_in_mis_count += 1
+                    if neighbors_in_mis_count == 2:
+                        break
+            if neighbors_in_mis_count == 1:
+                return (True, w)
+    return (False, -1) 
+
+def get_node_with_most_occurences(F):
+    count_dict = dict()
+    for edge in F:
+        for node in edge:
+            if node in count_dict:
+                count_dict[node]+=1
+            else:
+                count_dict[node]=0
+    maximum = 0
+    max_node = None
+    for node in count_dict:
+        if count_dict[node] > maximum:
+            max_node = node
+    return node
+
+def replace_node_if_possible(G,F,mis,node):
+    (can_be_replaced, new_node) = node_is_new_candidate(G,node,mis)
+    if can_be_replaced:
+        mis.remove(node)
+        mis.add(new_node)
+        return True
+    return False 
+
+def replace_forbiden_nodes(G,R,F,mis):
+    while len(F) > 0:
+        replaced = False
+        for edge in F:
+            for node in edge:
+                replaced = replace_node_if_possible(G,F,mis,node)
+                if replaced:
+                    break
+            if replaced:
+                break
+        if not replaced:
+            node_to_be_removed = get_node_with_most_occurences(F)
+            mis.remove(node_to_be_removed)
+        F = find_forbidden_edges(G, R, mis)
+    return mis
+
+def build_G_from_left_nodes(G, nodes):
+    mis_with_neighbours = set()
+    for node in nodes:
+        mis_with_neighbours.add(node)
+        for neighbour in G.neighbors(node):
+            mis_with_neighbours.add(neighbour)
+    nodes_left_to_process = set(G.nodes()).difference(mis_with_neighbours)
+    return build_G_from_nodes(G,nodes_left_to_process)
+
+def calculate_mis_with_left_nodes(G, mis_list, max_epochs,method):
+    (left_G, left_index_map, left_node_map)  = build_G_from_left_nodes(G, mis_list)
+    if len(left_G.nodes()) > 100:
+        mis = calculate_large_G(left_G, max_epochs)
+    elif len(left_G.nodes()) > 0:
+        mis = validate_dnn_result(train_network(left_G, max_epochs,method),left_G)
+    else:
+        mis = {}
+    mis_correct = [left_index_map[node] for node in mis]
+    mis_final = mis_list.union(mis_correct)
+    return mis_final
+
+def build_U_from_IS(_lambda, IS,G,):
+    if len(IS) == 0:
+        return []
+    degree_list_ascending = [(G.degree(node),node) for node in IS]
+    degree_list_ascending.sort(key=lambda pair: pair[0])
+    return [pair[1] for pair in degree_list_ascending[:min(_lambda, len(IS))]]
+
+def validate_dnn_result(dnn_result, G):
+    if dnn_result.stuck:
+       if len(G.edges()) < 50:
+            mis = local_improvement(G,[0])
+        else:
+            communities = collect_communities_to_map(nx_comm.louvain_communities(G, resolution = 1.3, seed=seed))
+            if len(communities) > 1:
+                mis = calculate_large_G(G, resolution = 1.3)
+            else:
+                mis = nx.maximal_independent_set(G)
+        dnn_result_nodes = get_result_nodes(dnn_result.theta)
+        if len(dnn_result_nodes) > len(mis) and result_is_valid(G, dnn_result.theta):
+            return dnn_result_nodes
+        else:
+            return mis
+    else:
+        theta_for_small_G = dnn_result.theta
+        mis = get_result_nodes(theta_for_small_G)
+        return mis
+
+def try_remove_nodes_with_small_degree(I, G, max_epochs, method):
+    _lambda = 5
+    I_star = I
+    index = 0
+    while True:
+        U = build_U_from_IS(_lambda, I_star,G)
+        (reduced_G,index_map, node_map) = build_G_from_left_nodes(G, U)
+        if len(reduced_G.nodes()) < 20:
+            break
+        index+=1
+        dnn_result = train_network(reduced_G, max_epochs,method)
+        mis_correct = {index_map[node] for node in validate_dnn_result(dnn_result, reduced_G)}
+        I = set(I).union(U)
+        if(len(I)>len(I_star)):
+            I_star = I
+        else:
+            I = I_star
+        _lambda+=1
+    return I_star
+
+def nodes_must_be_in_mis(G):
+    n = len(G.nodes())
+    m = len(G.edges())
+    v_0 = [0 for i in range(n)]
+    v_1_2 = [0.5 for i in range(n)]
+    v_1 = [1 for i in range(n)]
+    x_bound = [(0, 1) for i in range(n)]
+    c = [-1 for i in range(n)]
+    A = []
+    b=[]
+    for (u,v) in G.edges():
+        u = int(u)
+        v = int(v)
+        if u < v:
+            con = [0 for i in range(n)]
+            con[u] = 1
+            con[v] = 1
+            A.append(con)
+            b.append(1)
+    res = linprog(c, A_ub=A, b_ub=b, bounds=x_bound,method='highs',)
+    nodes_that_must_be_in_mis = set()
+    for i in range(n):
+        if abs(res.x[i]-1)<0.001:
+            nodes_that_must_be_in_mis.add(i)
+    return nodes_that_must_be_in_mis
+
+def nodes_that_are_clique(G):
+    cliques = set()
+    clique_neighbors = set()
+    for node in G.nodes():
+        if node not in clique_neighbors:
+            is_clique = True
+            neighbors = set(G.neighbors(node))
+            for n1 in neighbors:
+                for n2 in neighbors:
+                    if n1!=n2 and not G.has_edge(n1,n2):
+                        is_clique = False
+            if is_clique:
+                clique_neighbors.update(neighbors)
+                cliques.add(node)
+    return cliques
+
+def process_community(G, max_epochs, method, resolution, file_suffix):
+    dnn_result = train_network(G, max_epochs,method)
+    mis = validate_dnn_result(dnn_result, G)
+    log_error_if_mis_is_wrong(G, mis)
+    mis = try_remove_nodes_with_small_degree(mis, G, max_epochs, method)
+    log_error_if_mis_is_wrong(G, mis)
+    return mis
+
+def process_main_algo(G, max_epochs, method, resolution, file_suffix):
+    communities = collect_communities_to_map(nx_comm.louvain_communities(G, resolution, seed=seed))
+    
+    mis_list = set()
+    community_index = 1
+    write_G_to_file_in_metis_format(G,  "KaMIS/deploy/"+file_suffix)
+    
+    for com in communities:
+        (G_com,index_map, node_map) = build_G_from_nodes(G, communities[com])
+        
+        write_G_to_file_in_metis_format(G_com,  "KaMIS/deploy/"+file_suffix+"community_" + str(com) )
+        mis_com = process_community(G_com, max_epochs, method, resolution, file_suffix)
+        mis_correct = {index_map[node] for node in mis_com}
+        
+        mis_list = mis_list.union(mis_correct)        
+        community_index += 1
+        
+    R = find_inter_cluster_edges(G, communities)
+    F = find_forbidden_edges(G, R, mis_list)
+    replace_forbiden_nodes(G,R,F,mis_list)
+    mis_list = calculate_mis_with_left_nodes(G, mis_list, max_epochs,method)
+    log_error_if_mis_is_wrong(G, mis_list)
+    return mis_list
+
+def process_lp(G, max_epochs, method, resolution, file_suffix):
+    density = nx.density(G)
+    should_use_lp = density < 0.1
+    G_before_LP = G
+    if should_use_lp:
+        nodes_from_lp_solver = nodes_must_be_in_mis(G)
+        (G, index_map,_) = build_G_from_left_nodes(G, nodes_from_lp_solver)
+        if len(G.nodes()) == 0:
+            log_error_if_mis_is_wrong(G_before_LP, nodes_from_lp_solver)
+            return nodes_from_lp_solver
+    mis_list = process_main_algo(G, max_epochs, method, resolution, file_suffix)
+    if should_use_lp:
+        mis_list = {index_map[node] for node in mis_list}
+        mis_list = mis_list.union(nodes_from_lp_solver)
+    log_error_if_mis_is_wrong(G_before_LP, mis_list)
+    return mis_list
+def process_cliques(G, max_epochs, method, resolution, file_suffix):
+    G_before_cliques = G
+    cliques = nodes_that_are_clique(G)
+    (G, cliques_index_map,_) = build_G_from_left_nodes(G, cliques)
+    if len(G.nodes()) == 0:
+        log_error_if_mis_is_wrong(initial_G, cliques)
+        return cliques
+    mis_list=process_lp(G, max_epochs, method, resolution, file_suffix)
+    mis_list = {cliques_index_map[node] for node in mis_list}
+    mis_list = mis_list.union(cliques)
+    log_error_if_mis_is_wrong(G_before_cliques, mis_list)
+    return mis_list
+
+def local_improvement(G, mis):
+    should_recalculate = True
+    mis_flags = [0 for node in G.nodes()]
+    for node in G.nodes():
+        if node in mis:
+            mis_flags[node] = 1
+    while should_recalculate:
+        L = [[] for i in range(len(mis_flags))]
+        for node in G.nodes():
+            if mis_flags[node] == 1:
+                for n in G.neighbors(node):
+                    tight = 0
+                    for k in G.neighbors(n):
+                        if mis_flags[k] == 1:
+                            tight+=1
+                    if tight == 1:
+                        L[node].append(n)
+                L[node].sort()
+        
+        for x in range(len(mis_flags)):
+            if mis_flags[x] == 1:
+                replaced = False
+                if len(L[x]) > 1:
+                    for v in L[x]:
+                        for w in L[x]:
+                            if v < w and not G.has_edge(v,w):
+                                mis_flags[x] = 0
+                                mis_flags[v] = 1
+                                mis_flags[w] = 1
+                                replaced = True
+                                break
+                        if replaced:
+                            break
+                    if replaced:
+                            break
+        if not replaced:
+            for node in G.nodes():
+                if mis_flags[node] == 0:
+                    node_is_free = True
+                    for neigh in G.neighbors(node):
+                        if mis_flags[neigh] == 1:
+                            node_is_free = False
+                    if node_is_free:
+                        replaced = True
+                        mis_flags[node] = 1
+                        break
+        should_recalculate = replaced
+    new_mis = set()
+    for i in range(len(mis_flags)):
+        if mis_flags[i]==1:
+            new_mis.add(i)
+    return new_mis
+    
+def calculate_large_G(G, max_epochs = 1000, method='gradient', resolution = 0.8, file_suffix = "graph"):
+    mis_list = process_cliques(G, max_epochs, method, resolution, file_suffix)
+    log_error_if_mis_is_wrong(G, mis_list)
+    improved = local_improvement(G,mis_list)
+    mis_list = improved
+    log_error_if_mis_is_wrong(G, mis_list)
+    return mis_list
+\end{lstlisting}

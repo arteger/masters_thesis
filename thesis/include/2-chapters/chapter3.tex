@@ -1,0 +1,102 @@
+\chapter{Heuristical solution improvement}
+\section{Preprocessing phase}
+On preprocessing phase we can increase the quality of the dNN solution by applying a few simple technics exploiting the graph structure and relation between cliques and independent sets.
+\subsection{Simplicial vertex reduction}
+A \textbf{simplicial} vertex is one whose neighbors form a clique: every two neighbors are adjacent.  
+In a graph $G$, a vertex $x$ is simplicial if its neighbourhood $N(x)$ induces a complete
+subgraph of $G$. A graph is triangulated if it does not contain as an induced subgraph
+a chordless cycle of length at least four (a \textit{hole}). A famous theorem of Dirac \cite{HOANG2004117} states
+that every triangulated graph has a simplicial vertex. Let us also say that a vertex is
+co-simplicial if its non-neighbours form an independent subset of vertices, and that a
+graph is co-triangulated if it does not contain the complement of a chordless cycle on at least four vertices (an \textit{antihole}). Dirac’s theorem says equivalently that every
+co-triangulated graph has a co-simplicial vertex. 
+\begin{theorem}[Dirac]
+Let $G$ be a triangulated graph. Then either $G$ is a clique or
+$G$ contains two non-adjacent simplicial vertices.
+\end{theorem}
+
+Noticing that if a subgraph $S$ of \graphG forms a clique than there can only be one vertex in this subgraph that will be part of the MIS. By finding all the simplicial vertices in the $G$ we can add them to the $\mathcal{I}$ and remove them with their neighborhood from the initial graph. In such way we can use deterministic search and  reduce the cardinality of graph $G$ to be processed by the dNN and obtain part of the MIS. 
+\begin{algorithm}[H]
+\caption{Simplicial nodes search}\label{alg:simplicial-nodes-search}
+\begin{algorithmic}
+\Function{Simplicial nodes reduction}{$G$}
+    \State $S = \varnothing$
+    \State $NB = \varnothing$
+    \For{$v \in V$}
+        \If{$v \notin NB$}
+            \State flag = 1
+            \For{$q \in N(v)$}
+                \For{$u \in N(v)$}
+                    \If{$q \neq v$ and $\nexists e_{q,u}$}
+                        \State flag = 0
+                    \EndIf
+                \EndFor
+            \EndFor
+            \If{flag = 1}
+                \State $S \leftarrow S \cup v$
+                \State $NB \leftarrow NB \cup N(v)$
+            \EndIf
+        \EndIf
+    \EndFor
+    \State $\hat{G} \leftarrow G[G\textbackslash (S \cup NB)]$
+    \State \Return $S$, $\hat{G}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Linear programming reduction}
+
+We exploit linear programming solution on graphs with low density (< 0.1) before community detection and applying dNN $h$. Minimization solution of 
+\begin{equation}
+    x^* = argmax \{\sum_{v\in V} x_v \text{ s.t. } x_v \geq 0, \forall v \in V, x_v + x_u \leq  1, \forall (u,v) \in E\}
+\end{equation}
+
+is obtained using linear programming solver built in $scipy$ python package. The vertices that belong to set $T = \{v \in V | {x^*}_v = 1\}$ must be in the MIS, so they can be removed from graph $G$ with their neighborhood $N(T)$. The solution $\mathcal{I}$ that is obtained after communities processing on $G[V\textbackslash(T\cup N(T))]$ and postprocessing phase can be joined with $T$ to obtain the MIS on $G$.
+
+\section{Postprocessing phase}
+To improve the solution of the dNN we utilize 2 simple technics on community and postprocessing phases - removing nodes with small degrees, and permutational maximization with local search.
+
+\subsection{Small degrees vertices reduction}
+Given graph G and solution I, we present a solution improvement technique that eliminates a group of low-degree nodes $U \in \mathcal{I}$, such that $|U| =,\lambda$ together with their neighbors $N(U)$ from the graph since high-degree nodes are less likely to be in a big IS. After that we apply our dNN to the smaller graph $G[V\textbackslash (U \cap N(U))$. This process is applied iteratively, increasing $\lambda$ with each iteration. Up until a certain stopping criterion is met, the best solution is retained. 
+
+\begin{algorithm}
+\caption{Low-degree vertices excluding}\label{alg:log-degree-vertices-excluding}
+\begin{algorithmic}
+\State \textbf{Input:} \graphG, Solution $\mathcal{I},\lambda, IncreaseStep$
+\State \textbf{Output:} $\mathcal{I}^*$
+\State \textbf{initialize:} $\mathcal{I}^* = \mathcal{I}$
+\While{stopping criteria is not satisfied}
+    \State \textbf{obtain} $U \subset \mathcal{I}:|U|=\lambda,\forall u \in U, v \in \mathcal{I}  U,d(u) \leq d(v)$
+    \State \textbf{obtain} $\mathcal{I}\leftarrow \mathcal{I}\cup \text{dNN}(G[V\textbackslash(U\cup N(U))],\alpha)$
+    \If{$|\mathcal{I}| > |\mathcal{I^*}|$ (update the optimum if $\mathcal{I}$ has higher cardinality) }
+        \State \textbf{update} $\mathcal{I}^* = \mathcal{I}$ 
+    \EndIf
+    \If{$|\mathcal{I}| \leq |\mathcal{I^*}|$ (restart from the current optimum) }
+        \State \textbf{update} $\mathcal{I} = \mathcal{I}^*$ 
+    \EndIf
+    \State \textbf{update} $\lambda \leftarrow \lambda + IncreaseStep$
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+After the tests, we decided that it is reasonable to set initial $\lambda$ to 5 and finish iterations when the cardinality of the new-obtained graph $G[V\textbackslash(U\cup N(U))]$ is less then 20. 
+
+The number of computations required for Algorithm \ref{alg:log-degree-vertices-excluding} depends on $\lambda$ and the
+rate by which it increases as this determines the size of the subgraph on which the $dNN$ procedure is applied on each iteration.
+
+\subsection{Local search improvement}
+The most effective methodology for designing MIS heuristics is local search. In our case we use the next 2-improvement algorithm \cite{local-search} to increase the size of the MIS during the postprocessing phase when all the communities are processed.
+
+For a vertex$v, v\notin \mathcal{I}$ let's call \textbf{tightness} ($\tau(v)$) of $v$ w.r.t $\mathcal{I}$ the quantity of neighbors of $v$ that belong to $\mathcal{I}$. If the vertex $v$ has tightness of 0, we call it a \textbf{free} vertex.
+It is obvious that if node $v$ belongs to $\mathcal{I}$ and $\exists q, q \in N(v), \tau(q) = 1$ than the only neighbour of $q$ that belongs to $\mathcal{I}$ is $v$.
+
+We construct a data structure $X$ that consists of 3 groups of vertices in $V$ w.r.t $\mathcal{I}$:
+\begin{itemize}
+    \item free nodes in $V$
+    \item non-free nodes in $V$
+    \item nodes that belong to $\mathcal{I}$
+\end{itemize}
+
+During the iteration of the algorithm if there are any free nodes we add 1 node of them to $\mathcal{I}$ and recompute $X$. If there are no free nodes in $X$ we try to find a node $v \in \mathcal{I}$, s.t. there are at least to nodes in it's neighbors s.t. their tightness is equal to exactly 1 and they don't have edge between them: $q,u \in N(v), \tau(q) = \tau(v) = 1, E[(q,u)] = \varnothing$. For this we calculate the tightness of the all non-free nodes and if their tightness is equal to 1 we add them to a map, grouped by vertex$v \in \mathcal{I}$. If such 2 neighbors $q,u$ of node $v$ are found and there is no edges between them we can remove node $v$ from $\mathcal{I}$ and add $q,v$ to $\mathcal{I}$ increasing the size of $\mathcal{I}$ by 1. After this we recompute $X$.
+We repeat this algorithm until there are no free nodes no pair of 1-tightness neighbors left in $X$. 
+
